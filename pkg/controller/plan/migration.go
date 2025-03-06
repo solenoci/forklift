@@ -27,6 +27,7 @@ import (
 	"github.com/konveyor/forklift-controller/pkg/settings"
 	batchv1 "k8s.io/api/batch/v1"
 	core "k8s.io/api/core/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -49,35 +50,46 @@ var (
 	CDIDiskCopy             libitr.Flag = 0x08
 	VirtV2vDiskCopy         libitr.Flag = 0x10
 	OpenstackImageMigration libitr.Flag = 0x20
+	VSphere                 libitr.Flag = 0x40
 )
 
 // Phases.
 const (
-	Started                  = "Started"
-	PreHook                  = "PreHook"
-	StorePowerState          = "StorePowerState"
-	PowerOffSource           = "PowerOffSource"
-	WaitForPowerOff          = "WaitForPowerOff"
-	CreateDataVolumes        = "CreateDataVolumes"
-	CreateVM                 = "CreateVM"
-	CopyDisks                = "CopyDisks"
-	AllocateDisks            = "AllocateDisks"
-	CopyingPaused            = "CopyingPaused"
-	AddCheckpoint            = "AddCheckpoint"
-	AddFinalCheckpoint       = "AddFinalCheckpoint"
-	CreateSnapshot           = "CreateSnapshot"
-	CreateInitialSnapshot    = "CreateInitialSnapshot"
-	CreateFinalSnapshot      = "CreateFinalSnapshot"
-	Finalize                 = "Finalize"
-	CreateGuestConversionPod = "CreateGuestConversionPod"
-	ConvertGuest             = "ConvertGuest"
-	CopyDisksVirtV2V         = "CopyDisksVirtV2V"
-	PostHook                 = "PostHook"
-	Completed                = "Completed"
-	WaitForSnapshot          = "WaitForSnapshot"
-	WaitForInitialSnapshot   = "WaitForInitialSnapshot"
-	WaitForFinalSnapshot     = "WaitForFinalSnapshot"
-	ConvertOpenstackSnapshot = "ConvertOpenstackSnapshot"
+	Started                           = "Started"
+	PreHook                           = "PreHook"
+	StorePowerState                   = "StorePowerState"
+	PowerOffSource                    = "PowerOffSource"
+	WaitForPowerOff                   = "WaitForPowerOff"
+	CreateDataVolumes                 = "CreateDataVolumes"
+	WaitForDataVolumesStatus          = "WaitForDataVolumesStatus"
+	WaitForFinalDataVolumesStatus     = "WaitForFinalDataVolumesStatus"
+	CreateVM                          = "CreateVM"
+	CopyDisks                         = "CopyDisks"
+	AllocateDisks                     = "AllocateDisks"
+	CopyingPaused                     = "CopyingPaused"
+	AddCheckpoint                     = "AddCheckpoint"
+	AddFinalCheckpoint                = "AddFinalCheckpoint"
+	CreateSnapshot                    = "CreateSnapshot"
+	CreateInitialSnapshot             = "CreateInitialSnapshot"
+	CreateFinalSnapshot               = "CreateFinalSnapshot"
+	Finalize                          = "Finalize"
+	CreateGuestConversionPod          = "CreateGuestConversionPod"
+	ConvertGuest                      = "ConvertGuest"
+	CopyDisksVirtV2V                  = "CopyDisksVirtV2V"
+	PostHook                          = "PostHook"
+	Completed                         = "Completed"
+	WaitForSnapshot                   = "WaitForSnapshot"
+	WaitForInitialSnapshot            = "WaitForInitialSnapshot"
+	WaitForFinalSnapshot              = "WaitForFinalSnapshot"
+	ConvertOpenstackSnapshot          = "ConvertOpenstackSnapshot"
+	StoreSnapshotDeltas               = "StoreSnapshotDeltas"
+	StoreInitialSnapshotDeltas        = "StoreInitialSnapshotDeltas"
+	RemovePreviousSnapshot            = "RemovePreviousSnapshot"
+	RemovePenultimateSnapshot         = "RemovePenultimateSnapshot"
+	RemoveFinalSnapshot               = "RemoveFinalSnapshot"
+	WaitForFinalSnapshotRemoval       = "WaitForFinalSnapshotRemoval"
+	WaitForPreviousSnapshotRemoval    = "WaitForPreviousSnapshotRemoval"
+	WaitForPenultimateSnapshotRemoval = "WaitForPenultimateSnapshotRemoval"
 )
 
 // Steps.
@@ -93,8 +105,9 @@ const (
 )
 
 const (
-	TransferCompleted  = "Transfer completed."
-	PopulatorPodPrefix = "populate-"
+	TransferCompleted              = "Transfer completed."
+	PopulatorPodPrefix             = "populate-"
+	DvStatusCheckRetriesAnnotation = "dvStatusCheckRetries"
 )
 
 var (
@@ -125,19 +138,29 @@ var (
 			{Name: PreHook, All: HasPreHook},
 			{Name: CreateInitialSnapshot},
 			{Name: WaitForInitialSnapshot},
+			{Name: StoreInitialSnapshotDeltas, All: VSphere},
 			{Name: CreateDataVolumes},
+			{Name: WaitForDataVolumesStatus},
 			{Name: CopyDisks},
 			{Name: CopyingPaused},
+			{Name: RemovePreviousSnapshot, All: VSphere},
+			{Name: WaitForPreviousSnapshotRemoval, All: VSphere},
 			{Name: CreateSnapshot},
 			{Name: WaitForSnapshot},
+			{Name: StoreSnapshotDeltas, All: VSphere},
 			{Name: AddCheckpoint},
 			{Name: StorePowerState},
 			{Name: PowerOffSource},
 			{Name: WaitForPowerOff},
+			{Name: RemovePenultimateSnapshot, All: VSphere},
+			{Name: WaitForPenultimateSnapshotRemoval, All: VSphere},
 			{Name: CreateFinalSnapshot},
 			{Name: WaitForFinalSnapshot},
 			{Name: AddFinalCheckpoint},
+			{Name: WaitForFinalDataVolumesStatus},
 			{Name: Finalize},
+			{Name: RemoveFinalSnapshot, All: VSphere},
+			{Name: WaitForFinalSnapshotRemoval, All: VSphere},
 			{Name: CreateGuestConversionPod, All: RequiresConversion},
 			{Name: ConvertGuest, All: RequiresConversion},
 			{Name: CreateVM},
@@ -198,15 +221,21 @@ func (r *Migration) Run() (reQ time.Duration, err error) {
 			return
 		}
 	}
-
-	vm, hasNext, err := r.scheduler.Next()
-	if err != nil {
-		return
-	}
-	if hasNext {
-		err = r.execute(vm)
+	for {
+		var hasNext bool
+		var vm *plan.VMStatus
+		vm, hasNext, err = r.scheduler.Next()
 		if err != nil {
 			return
+		}
+		if hasNext {
+			err = r.execute(vm)
+			if err != nil {
+				return
+			}
+		} else {
+			r.Log.Info("The scheduler does not have any additional VMs.")
+			break
 		}
 	}
 
@@ -344,6 +373,11 @@ func (r *Migration) begin() (err error) {
 // Archive the plan.
 // Best effort to remove any retained migration resources.
 func (r *Migration) Archive() {
+	defer func() {
+		if r.provider != nil {
+			r.provider.Close()
+		}
+	}()
 	if err := r.init(); err != nil {
 		r.Log.Error(err, "Archive initialization failed.")
 		return
@@ -375,6 +409,11 @@ func (r *Migration) Archive() {
 }
 
 func (r *Migration) SetPopulatorDataSourceLabels() {
+	defer func() {
+		if r.provider != nil {
+			r.provider.Close()
+		}
+	}()
 	err := r.init()
 	if err != nil {
 		r.Log.Error(err, "Setting Populator Data Source labels failed.")
@@ -402,6 +441,11 @@ func (r *Migration) SetPopulatorDataSourceLabels() {
 // Cancel the migration.
 // Delete resources associated with VMs that have been marked canceled.
 func (r *Migration) Cancel() error {
+	defer func() {
+		if r.provider != nil {
+			r.provider.Close()
+		}
+	}()
 	if err := r.init(); err != nil {
 		return liberr.Wrap(err)
 	}
@@ -458,6 +502,9 @@ func (r *Migration) cleanup(vm *plan.VMStatus, failOnErr func(error) bool) error
 		if err := r.deletePopulatorPVCs(vm); failOnErr(err) {
 			return err
 		}
+		if err := r.kubevirt.DeleteDataVolumes(vm); failOnErr(err) {
+			return err
+		}
 	}
 	if err := r.deleteImporterPods(vm); failOnErr(err) {
 		return err
@@ -489,16 +536,21 @@ func (r *Migration) cleanup(vm *plan.VMStatus, failOnErr func(error) bool) error
 		return err
 	}
 
-	r.removeWarmSnapshots(vm)
+	r.removeLastWarmSnapshot(vm)
 
 	return nil
 }
 
-func (r *Migration) removeWarmSnapshots(vm *plan.VMStatus) {
+func (r *Migration) removeLastWarmSnapshot(vm *plan.VMStatus) {
 	if vm.Warm == nil {
 		return
 	}
-	if err := r.provider.RemoveSnapshots(vm.Ref, vm.Warm.Precopies, r.kubevirt.loadHosts); err != nil {
+	n := len(vm.Warm.Precopies)
+	if n < 1 {
+		return
+	}
+	snapshot := vm.Warm.Precopies[n-1].Snapshot
+	if _, err := r.provider.RemoveSnapshot(vm.Ref, snapshot, r.kubevirt.loadHosts); err != nil {
 		r.Log.Error(
 			err,
 			"Failed to clean up warm migration snapshots.",
@@ -638,13 +690,13 @@ func (r *Migration) itinerary() *libitr.Itinerary {
 // Get the name of the pipeline step corresponding to the current VM phase.
 func (r *Migration) step(vm *plan.VMStatus) (step string) {
 	switch vm.Phase {
-	case Started, CreateInitialSnapshot, WaitForInitialSnapshot, CreateDataVolumes:
+	case Started, CreateInitialSnapshot, WaitForInitialSnapshot, StoreInitialSnapshotDeltas, CreateDataVolumes:
 		step = Initialize
 	case AllocateDisks:
 		step = DiskAllocation
-	case CopyDisks, CopyingPaused, CreateSnapshot, WaitForSnapshot, AddCheckpoint, ConvertOpenstackSnapshot:
+	case CopyDisks, CopyingPaused, RemovePreviousSnapshot, WaitForPreviousSnapshotRemoval, CreateSnapshot, WaitForSnapshot, StoreSnapshotDeltas, AddCheckpoint, ConvertOpenstackSnapshot, WaitForDataVolumesStatus:
 		step = DiskTransfer
-	case CreateFinalSnapshot, WaitForFinalSnapshot, AddFinalCheckpoint, Finalize:
+	case RemovePenultimateSnapshot, WaitForPenultimateSnapshotRemoval, CreateFinalSnapshot, WaitForFinalSnapshot, AddFinalCheckpoint, Finalize, RemoveFinalSnapshot, WaitForFinalSnapshotRemoval, WaitForFinalDataVolumesStatus:
 		step = Cutover
 	case CreateGuestConversionPod, ConvertGuest:
 		step = ImageConversion
@@ -967,7 +1019,39 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 		if r.Migration.Spec.Cutover != nil && !r.Migration.Spec.Cutover.After(time.Now()) {
 			vm.Phase = StorePowerState
 		} else if vm.Warm.NextPrecopyAt != nil && !vm.Warm.NextPrecopyAt.After(time.Now()) {
-			vm.Phase = CreateSnapshot
+			vm.Phase = r.next(vm.Phase)
+		}
+	case RemovePreviousSnapshot, RemovePenultimateSnapshot, RemoveFinalSnapshot:
+		step, found := vm.FindStep(r.step(vm))
+		if !found {
+			vm.AddError(fmt.Sprintf("Step '%s' not found", r.step(vm)))
+			break
+		}
+		n := len(vm.Warm.Precopies)
+		var taskId string
+		taskId, err = r.provider.RemoveSnapshot(vm.Ref, vm.Warm.Precopies[n-1].Snapshot, r.kubevirt.loadHosts)
+		vm.Warm.Precopies[len(vm.Warm.Precopies)-1].RemoveTaskId = taskId
+		if err != nil {
+			step.AddError(err.Error())
+			err = nil
+			break
+		}
+		vm.Phase = r.next(vm.Phase)
+	case WaitForPreviousSnapshotRemoval, WaitForPenultimateSnapshotRemoval, WaitForFinalSnapshotRemoval:
+		step, found := vm.FindStep(r.step(vm))
+		if !found {
+			vm.AddError(fmt.Sprintf("Step '%s' not found", r.step(vm)))
+			break
+		}
+		precopy := vm.Warm.Precopies[len(vm.Warm.Precopies)-1]
+		ready, err := r.provider.CheckSnapshotRemove(vm.Ref, precopy, r.kubevirt.loadHosts)
+		if err != nil {
+			step.AddError(err.Error())
+			err = nil
+			break
+		}
+		if ready {
+			vm.Phase = r.next(vm.Phase)
 		}
 	case CreateInitialSnapshot, CreateSnapshot, CreateFinalSnapshot:
 		step, found := vm.FindStep(r.step(vm))
@@ -975,8 +1059,8 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 			vm.AddError(fmt.Sprintf("Step '%s' not found", r.step(vm)))
 			break
 		}
-		var snapshot string
-		if snapshot, err = r.provider.CreateSnapshot(vm.Ref, r.kubevirt.loadHosts); err != nil {
+		var snapshot, taskId string
+		if snapshot, taskId, err = r.provider.CreateSnapshot(vm.Ref, r.kubevirt.loadHosts); err != nil {
 			if errors.As(err, &web.ProviderNotReadyError{}) || errors.As(err, &web.ConflictError{}) {
 				return
 			}
@@ -985,7 +1069,7 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 			break
 		}
 		now := meta.Now()
-		precopy := plan.Precopy{Snapshot: snapshot, Start: &now}
+		precopy := plan.Precopy{Snapshot: snapshot, CreateTaskId: taskId, Start: &now}
 		vm.Warm.Precopies = append(vm.Warm.Precopies, precopy)
 		r.resetPrecopyTasks(vm, step)
 		vm.Phase = r.next(vm.Phase)
@@ -995,16 +1079,82 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 			vm.AddError(fmt.Sprintf("Step '%s' not found", r.step(vm)))
 			break
 		}
-		snapshot := vm.Warm.Precopies[len(vm.Warm.Precopies)-1].Snapshot
-		ready, err := r.provider.CheckSnapshotReady(vm.Ref, snapshot)
+		precopy := vm.Warm.Precopies[len(vm.Warm.Precopies)-1]
+		ready, snapshotId, err := r.provider.CheckSnapshotReady(vm.Ref, precopy, r.kubevirt.loadHosts)
 		if err != nil {
 			step.AddError(err.Error())
 			err = nil
 			break
 		}
 		if ready {
+			if snapshotId != "" {
+				vm.Warm.Precopies[len(vm.Warm.Precopies)-1].Snapshot = snapshotId
+			}
 			vm.Phase = r.next(vm.Phase)
 		}
+	case WaitForDataVolumesStatus, WaitForFinalDataVolumesStatus:
+		step, found := vm.FindStep(r.step(vm))
+		if !found {
+			vm.AddError(fmt.Sprintf("Step '%s' not found", r.step(vm)))
+			break
+		}
+
+		dvs, err := r.kubevirt.getDVs(vm)
+		if err != nil {
+			step.AddError(err.Error())
+			err = nil
+			break
+		}
+		if !r.hasPausedDv(dvs) {
+			vm.Phase = r.next(vm.Phase)
+			// Reset for next precopy
+			step.Annotations[DvStatusCheckRetriesAnnotation] = "1"
+		} else {
+			var retries int
+			retriesAnnotation := step.Annotations[DvStatusCheckRetriesAnnotation]
+			if retriesAnnotation == "" {
+				step.Annotations[DvStatusCheckRetriesAnnotation] = "1"
+			} else {
+				retries, err = strconv.Atoi(retriesAnnotation)
+				if err != nil {
+					step.AddError(err.Error())
+					err = nil
+					break
+				}
+				if retries >= settings.Settings.DvStatusCheckRetries {
+					// Do not fail the step as this can happen when the user runs the warm migration but the VM is already shutdown
+					// In that case we don't create any delta and don't change the CDI DV status.
+					r.Log.Info(
+						"DataVolume status check exceeded the retry limit."+
+							"If this causes the problems with the snapshot removal in the CDI please bump the controller_dv_status_check_retries.",
+						"vm",
+						vm.String())
+					vm.Phase = r.next(vm.Phase)
+					// Reset for next precopy
+					step.Annotations[DvStatusCheckRetriesAnnotation] = "1"
+				} else {
+					step.Annotations[DvStatusCheckRetriesAnnotation] = strconv.Itoa(retries + 1)
+				}
+			}
+		}
+	case StoreInitialSnapshotDeltas, StoreSnapshotDeltas:
+		step, found := vm.FindStep(r.step(vm))
+		if !found {
+			vm.AddError(fmt.Sprintf("Step '%s' not found", r.step(vm)))
+			break
+		}
+
+		n := len(vm.Warm.Precopies)
+		snapshot := vm.Warm.Precopies[n-1].Snapshot
+		var deltas map[string]string
+		deltas, err = r.provider.GetSnapshotDeltas(vm.Ref, snapshot, r.kubevirt.loadHosts)
+		if err != nil {
+			step.AddError(err.Error())
+			err = nil
+			break
+		}
+		vm.Warm.Precopies[n-1].WithDeltas(deltas)
+		vm.Phase = r.next(vm.Phase)
 	case AddCheckpoint, AddFinalCheckpoint:
 		step, found := vm.FindStep(r.step(vm))
 		if !found {
@@ -1021,9 +1171,9 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 
 		switch vm.Phase {
 		case AddCheckpoint:
-			vm.Phase = CopyDisks
+			vm.Phase = WaitForDataVolumesStatus
 		case AddFinalCheckpoint:
-			vm.Phase = Finalize
+			vm.Phase = WaitForFinalDataVolumesStatus
 		}
 	case StorePowerState:
 		step, found := vm.FindStep(r.step(vm))
@@ -1092,14 +1242,6 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 			return
 		}
 		if step.MarkedCompleted() {
-			err = r.provider.RemoveSnapshots(vm.Ref, vm.Warm.Precopies, r.kubevirt.loadHosts)
-			if err != nil {
-				r.Log.Info(
-					"Failed to clean up warm migration snapshots.",
-					"vm",
-					vm)
-				err = nil
-			}
 			if !step.HasError() {
 				step.Phase = Completed
 				vm.Phase = r.next(vm.Phase)
@@ -1146,7 +1288,7 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 				return err
 			}
 
-			if pod != nil && pod.Status.Phase != core.PodSucceeded {
+			if pod != nil && pod.Status.Phase == core.PodRunning {
 				err := r.kubevirt.UpdateVmByConvertedConfig(vm, pod, step)
 				if err != nil {
 					return liberr.Wrap(err)
@@ -1213,6 +1355,15 @@ func (r *Migration) execute(vm *plan.VMStatus) (err error) {
 	}
 
 	return
+}
+
+func (r *Migration) hasPausedDv(dvs []ExtendedDataVolume) bool {
+	for _, dv := range dvs {
+		if dv.Status.Phase == Paused {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Migration) resetPrecopyTasks(vm *plan.VMStatus, step *plan.Step) {
@@ -1579,7 +1730,26 @@ func (r *Migration) updateCopyProgress(vm *plan.VMStatus, step *plan.Step) (err 
 							path.Join(dv.Namespace, dv.Name))
 						continue
 					}
-
+					err = r.Destination.Client.Get(context.TODO(), types.NamespacedName{
+						Namespace: r.Plan.Spec.TargetNamespace,
+						Name:      fmt.Sprintf("prime-%s", pvc.UID),
+					}, pvc)
+					if err != nil {
+						if k8serr.IsNotFound(err) {
+							log.Info("Could not find prime PVC")
+							// Ignore error
+							err = nil
+						} else {
+							log.Error(
+								err,
+								"Could not get prime PVC for DataVolume.",
+								"vm",
+								vm.String(),
+								"dv",
+								path.Join(dv.Namespace, dv.Name))
+							continue
+						}
+					}
 					importer, found, kErr = r.kubevirt.GetImporterPod(*pvc)
 				}
 
@@ -1655,11 +1825,11 @@ func (r *Migration) updateConversionProgress(vm *plan.VMStatus, step *plan.Step)
 			break
 		}
 
-		coldLocal, err := r.Context.Plan.VSphereColdLocal()
+		useV2vForTransfer, err := r.Context.Plan.ShouldUseV2vForTransfer()
 		switch {
 		case err != nil:
 			return liberr.Wrap(err)
-		case coldLocal:
+		case useV2vForTransfer:
 			if err := r.updateConversionProgressV2vMonitor(pod, step); err != nil {
 				// Just log it. Missing progress is not fatal.
 				log.Error(err, "Failed to update conversion progress")
@@ -1850,7 +2020,7 @@ type Predicate struct {
 
 // Evaluate predicate flags.
 func (r *Predicate) Evaluate(flag libitr.Flag) (allowed bool, err error) {
-	coldLocal, vErr := r.context.Plan.VSphereColdLocal()
+	useV2vForTransfer, vErr := r.context.Plan.ShouldUseV2vForTransfer()
 	if vErr != nil {
 		err = vErr
 		return
@@ -1864,11 +2034,13 @@ func (r *Predicate) Evaluate(flag libitr.Flag) (allowed bool, err error) {
 	case RequiresConversion:
 		allowed = r.context.Source.Provider.RequiresConversion()
 	case CDIDiskCopy:
-		allowed = !coldLocal
+		allowed = !useV2vForTransfer
 	case VirtV2vDiskCopy:
-		allowed = coldLocal
+		allowed = useV2vForTransfer
 	case OpenstackImageMigration:
 		allowed = r.context.Plan.IsSourceProviderOpenstack()
+	case VSphere:
+		allowed = r.context.Plan.IsSourceProviderVSphere()
 	}
 
 	return

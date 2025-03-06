@@ -6,10 +6,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"path"
 	"strconv"
 
-	net "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	api "github.com/konveyor/forklift-controller/pkg/apis/forklift/v1beta1"
 	refapi "github.com/konveyor/forklift-controller/pkg/apis/forklift/v1beta1/ref"
 	"github.com/konveyor/forklift-controller/pkg/controller/plan/adapter"
@@ -25,6 +26,7 @@ import (
 	core "k8s.io/api/core/v1"
 	v1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
@@ -53,6 +55,7 @@ const (
 	VMMissingChangedBlockTracking = "VMMissingChangedBlockTracking"
 	HostNotReady                  = "HostNotReady"
 	DuplicateVM                   = "DuplicateVM"
+	SharedDisks                   = "SharedDisks"
 	NameNotValid                  = "TargetNameNotValid"
 	HookNotValid                  = "HookNotValid"
 	HookNotReady                  = "HookNotReady"
@@ -100,6 +103,10 @@ const (
 const (
 	True  = libcnd.True
 	False = libcnd.False
+)
+
+const (
+	Shareable = "shareable"
 )
 
 // Validate the plan resource.
@@ -450,6 +457,13 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		Message:  "Changed Block Tracking (CBT) has not been enabled on some VM. This feature is a prerequisite for VM warm migration.",
 		Items:    []string{},
 	}
+	sharedDisks := libcnd.Condition{
+		Type:     SharedDisks,
+		Status:   True,
+		Category: Critical,
+		Message:  "VMs with shared disk can not be migrated.", // This should be set by the provider validator
+		Items:    []string{},
+	}
 
 	setOf := map[string]bool{}
 	//
@@ -549,6 +563,25 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 		if !ok {
 			missingStaticIPs.Items = append(missingStaticIPs.Items, ref.String())
 		}
+
+		var ctx *plancontext.Context
+		ctx, err = plancontext.New(r, plan, r.Log)
+		if err != nil {
+			return err
+		}
+		ok, msg, category, err := validator.SharedDisks(*ref, ctx.Destination.Client)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			if msg != "" {
+				sharedDisks.Message = msg
+			}
+			if category != "" {
+				sharedDisks.Category = category
+			}
+			sharedDisks.Items = append(sharedDisks.Items, ref.String())
+		}
 		// Destination.
 		provider = plan.Referenced.Provider.Destination
 		if provider == nil {
@@ -619,6 +652,9 @@ func (r *Reconciler) validateVM(plan *api.Plan) error {
 	if len(missingStaticIPs.Items) > 0 {
 		plan.Status.SetCondition(missingStaticIPs)
 	}
+	if len(sharedDisks.Items) > 0 {
+		plan.Status.SetCondition(sharedDisks)
+	}
 	if len(missingCbtForWarm.Items) > 0 {
 		plan.Status.SetCondition(missingCbtForWarm)
 	}
@@ -638,11 +674,18 @@ func (r *Reconciler) validateTransferNetwork(plan *api.Plan) (err error) {
 		Reason:   NotFound,
 		Message:  "Transfer network is not valid.",
 	}
+	notValid := libcnd.Condition{
+		Type:     TransferNetNotValid,
+		Status:   True,
+		Category: Critical,
+		Reason:   NotValid,
+		Message:  "Transfer network default route annotation is not a valid IP address.",
+	}
 	key := client.ObjectKey{
 		Namespace: plan.Spec.TransferNetwork.Namespace,
 		Name:      plan.Spec.TransferNetwork.Name,
 	}
-	netAttachDef := &net.NetworkAttachmentDefinition{}
+	netAttachDef := &k8snet.NetworkAttachmentDefinition{}
 	err = r.Get(context.TODO(), key, netAttachDef)
 	if k8serr.IsNotFound(err) {
 		err = nil
@@ -651,6 +694,15 @@ func (r *Reconciler) validateTransferNetwork(plan *api.Plan) (err error) {
 	}
 	if err != nil {
 		err = liberr.Wrap(err)
+		return
+	}
+	route, found := netAttachDef.Annotations[AnnForkliftNetworkRoute]
+	if !found {
+		return
+	}
+	ip := net.ParseIP(route)
+	if ip == nil {
+		plan.Status.SetCondition(notValid)
 	}
 
 	return
@@ -888,6 +940,16 @@ func createVddkCheckJob(plan *api.Plan, labels map[string]string, vddkImage stri
 					Drop: []core.Capability{"ALL"},
 				},
 			},
+			Resources: core.ResourceRequirements{
+				Requests: core.ResourceList{
+					core.ResourceCPU:    resource.MustParse("100m"),
+					core.ResourceMemory: resource.MustParse("150Mi"),
+				},
+				Limits: core.ResourceList{
+					core.ResourceCPU:    resource.MustParse("1000m"),
+					core.ResourceMemory: resource.MustParse("500Mi"),
+				},
+			},
 		},
 	}
 
@@ -930,7 +992,17 @@ func createVddkCheckJob(plan *api.Plan, labels map[string]string, vddkImage stri
 					InitContainers:  initContainers,
 					Containers: []core.Container{
 						{
-							Name:  "validator",
+							Name: "validator",
+							Resources: core.ResourceRequirements{
+								Requests: core.ResourceList{
+									core.ResourceCPU:    resource.MustParse("100m"),
+									core.ResourceMemory: resource.MustParse("150Mi"),
+								},
+								Limits: core.ResourceList{
+									core.ResourceCPU:    resource.MustParse("1000m"),
+									core.ResourceMemory: resource.MustParse("500Mi"),
+								},
+							},
 							Image: Settings.Migration.VirtV2vImage,
 							SecurityContext: &core.SecurityContext{
 								AllowPrivilegeEscalation: ptr.To(false),

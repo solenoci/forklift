@@ -26,6 +26,10 @@ spec:
     value: quay.io/redhat-user-workloads/rh-ee-solenoci-tenant/forklift-controller:{{revision}}
   - name: dockerfile
     value: build/forklift-controller/Containerfile
+  - name: path-context
+    value: .
+  - name: build-source-image
+    value: "true"
   pipelineSpec:
     description: |
       This pipeline is ideal for building container images from a Containerfile while maintaining trust after pipeline customization.

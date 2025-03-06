@@ -41,7 +41,8 @@ import (
 
 // BIOS types
 const (
-	Efi = "efi"
+	Efi  = "efi"
+	BIOS = "bios"
 )
 
 // Bus types
@@ -79,6 +80,10 @@ const (
 const (
 	// CDI import backing file annotation on PVC
 	AnnImportBackingFile = "cdi.kubevirt.io/storage.import.backingFile"
+)
+
+const (
+	Shareable = "shareable"
 )
 
 // Map of vmware guest ids to osinfo ids.
@@ -193,7 +198,9 @@ func (r *Builder) PodEnvironment(vmRef ref.Ref, sourceSecret *core.Secret) (env 
 		err = liberr.Wrap(err, "vm", vmRef.String())
 		return
 	}
-
+	if !r.Context.Plan.Spec.MigrateSharedDisks {
+		vm.RemoveSharedDisks()
+	}
 	macsToIps := ""
 	if r.Plan.Spec.PreserveStaticIPs {
 		macsToIps, err = r.mapMacStaticIps(vm)
@@ -251,32 +258,28 @@ func (r *Builder) mapMacStaticIps(vm *model.VM) (ipMap string, err error) {
 	// on linux we collect all networks.
 	isWindowsFlag := isWindows(vm)
 
-	configurations := []string{}
-	gatewaySet := false
+	var configurations []string
 	for _, guestNetwork := range vm.GuestNetworks {
 		if !isWindowsFlag || guestNetwork.Origin == string(types.NetIpConfigInfoIpAddressOriginManual) {
 			gateway := ""
-			if !gatewaySet {
-				isIpv4 := net.IP.To4(net.ParseIP(guestNetwork.IP)) != nil
-				for _, ipStack := range vm.GuestIpStacks {
-					gwIpv4 := net.IP.To4(net.ParseIP(ipStack.Gateway)) != nil
-					if gwIpv4 && !isIpv4 || !gwIpv4 && isIpv4 {
-						// not the right IPv4 / IPv6 correlation
-						continue
-					}
-					network, err := netip.ParsePrefix(fmt.Sprintf("%s/%d", guestNetwork.IP, guestNetwork.PrefixLength))
-					if err != nil {
-						return "", err
-					}
-					gw, err := netip.ParseAddr(ipStack.Gateway)
-					if err != nil {
-						return "", err
-					}
-					if network.Contains(gw) {
-						// checks if the gateway in the right network subnet. we set gateway only once as it is suppose to be system wide.
-						gateway = ipStack.Gateway
-						gatewaySet = true
-					}
+			isIpv4 := net.IP.To4(net.ParseIP(guestNetwork.IP)) != nil
+			for _, ipStack := range vm.GuestIpStacks {
+				gwIpv4 := net.IP.To4(net.ParseIP(ipStack.Gateway)) != nil
+				if gwIpv4 && !isIpv4 || !gwIpv4 && isIpv4 {
+					// not the right IPv4 / IPv6 correlation
+					continue
+				}
+				network, err := netip.ParsePrefix(fmt.Sprintf("%s/%d", guestNetwork.IP, guestNetwork.PrefixLength))
+				if err != nil {
+					return "", err
+				}
+				gw, err := netip.ParseAddr(ipStack.Gateway)
+				if err != nil {
+					return "", err
+				}
+				if network.Contains(gw) {
+					// checks if the gateway in the right network subnet. we set gateway only once as it is suppose to be system wide.
+					gateway = ipStack.Gateway
 				}
 			}
 			dnsString := strings.Join(guestNetwork.DNS, ",")
@@ -402,7 +405,9 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 		err = liberr.Wrap(err, "vm", vmRef.String())
 		return
 	}
-
+	if !r.Context.Plan.Spec.MigrateSharedDisks {
+		vm.RemoveSharedDisks()
+	}
 	url := r.Source.Provider.Spec.URL
 	thumbprint := r.Source.Provider.Status.Fingerprint
 	hostID, err := r.hostID(vmRef)
@@ -438,12 +443,12 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 			if disk.Datastore.ID == ds.ID {
 				storageClass := mapped.Destination.StorageClass
 				var dvSource cdi.DataVolumeSource
-				coldLocal, vErr := r.Context.Plan.VSphereColdLocal()
+				useV2vForTransfer, vErr := r.Context.Plan.ShouldUseV2vForTransfer()
 				if vErr != nil {
 					err = vErr
 					return
 				}
-				if coldLocal {
+				if useV2vForTransfer {
 					// Let virt-v2v do the copying
 					dvSource = cdi.DataVolumeSource{
 						Blank: &cdi.DataVolumeBlankImage{},
@@ -452,7 +457,7 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 					// Let CDI do the copying
 					dvSource = cdi.DataVolumeSource{
 						VDDK: &cdi.DataVolumeSourceVDDK{
-							BackingFile:  r.baseVolume(disk.File),
+							BackingFile:  baseVolume(disk.File, r.Plan.Spec.Warm),
 							UUID:         vm.UUID,
 							URL:          url,
 							SecretRef:    secret.Name,
@@ -486,7 +491,10 @@ func (r *Builder) DataVolumes(vmRef ref.Ref, secret *core.Secret, _ *core.Config
 				if dv.ObjectMeta.Annotations == nil {
 					dv.ObjectMeta.Annotations = make(map[string]string)
 				}
-				dv.ObjectMeta.Annotations[planbase.AnnDiskSource] = r.baseVolume(disk.File)
+				dv.ObjectMeta.Annotations[planbase.AnnDiskSource] = baseVolume(disk.File, r.Plan.Spec.Warm)
+				if disk.Shared {
+					dv.ObjectMeta.Labels[Shareable] = "true"
+				}
 				dvs = append(dvs, *dv)
 			}
 		}
@@ -525,6 +533,20 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, 
 				vmRef.String()))
 		return
 	}
+	if !r.Context.Plan.Spec.MigrateSharedDisks {
+		sharedPVCs, missingDiskPVCs, err := findSharedPVCs(r.Destination.Client, vm)
+		if err != nil {
+			return liberr.Wrap(err)
+		}
+		for _, disk := range missingDiskPVCs {
+			// This is one of the last steps of migration we should not fail as users can migrate the disk later and reattach it manually.
+			r.Log.Error(err, "Failed to find shared PVCs", "vm", vmRef.String(), "disk", disk.File)
+			vm.RemoveDisk(disk)
+		}
+		if sharedPVCs != nil {
+			persistentVolumeClaims = append(persistentVolumeClaims, sharedPVCs...)
+		}
+	}
 
 	var conflicts []string
 	conflicts, err = r.macConflicts(vm)
@@ -545,9 +567,11 @@ func (r *Builder) VirtualMachine(vmRef ref.Ref, object *cnv.VirtualMachineSpec, 
 	if object.Template == nil {
 		object.Template = &cnv.VirtualMachineInstanceTemplateSpec{}
 	}
-	r.mapDisks(vm, vmRef, persistentVolumeClaims, object)
+	err = r.mapDisks(vm, vmRef, persistentVolumeClaims, object)
+	if err != nil {
+		return
+	}
 	r.mapFirmware(vm, object)
-	r.setMachine(object)
 	if !usesInstanceType {
 		r.mapCPU(vm, object)
 		r.mapMemory(vm, object)
@@ -582,7 +606,7 @@ func (r *Builder) mapNetworks(vm *model.VM, object *cnv.VirtualMachineSpec) (err
 		needed := []vsphere.NIC{}
 		for _, nic := range vm.NICs {
 			switch network.Variant {
-			case vsphere.NetDvPortGroup:
+			case vsphere.NetDvPortGroup, vsphere.OpaqueNetwork:
 				if nic.Network.ID == network.Key {
 					needed = append(needed, nic)
 				}
@@ -644,18 +668,9 @@ func (r *Builder) mapClock(host *model.Host, object *cnv.VirtualMachineSpec) {
 	}
 }
 
-func (r *Builder) setMachine(object *cnv.VirtualMachineSpec) {
-	object.Template.Spec.Domain.Machine = &cnv.Machine{Type: "q35"}
-}
-
 func (r *Builder) mapMemory(vm *model.VM, object *cnv.VirtualMachineSpec) {
 	memoryBytes := int64(vm.MemoryMB) * 1024 * 1024
 	reservation := resource.NewQuantity(memoryBytes, resource.BinarySI)
-	object.Template.Spec.Domain.Resources = cnv.ResourceRequirements{
-		Requests: map[core.ResourceName]resource.Quantity{
-			core.ResourceMemory: *reservation,
-		},
-	}
 	object.Template.Spec.Domain.Memory = &cnv.Memory{Guest: reservation}
 }
 
@@ -672,23 +687,24 @@ func (r *Builder) mapFirmware(vm *model.VM, object *cnv.VirtualMachineSpec) {
 	}
 	switch vm.Firmware {
 	case Efi:
-		// We don't distinguish between UEFI and UEFI with secure boot, but we anyway would have
-		// disabled secure boot, even if we knew it was enabled on the source, because the guest
-		// OS won't be able to boot without getting the NVRAM data. By starting the VM without
-		// secure boot we ease the procedure users need to do in order to make a guest OS that
-		// was previously configured with secure boot bootable.
-		secureBootEnabled := false
 		firmware.Bootloader = &cnv.Bootloader{
 			EFI: &cnv.EFI{
-				SecureBoot: &secureBootEnabled,
+				SecureBoot: &vm.SecureBoot,
 			}}
+		if vm.SecureBoot {
+			object.Template.Spec.Domain.Features = &cnv.Features{
+				SMM: &cnv.FeatureState{
+					Enabled: &vm.SecureBoot,
+				},
+			}
+		}
 	default:
 		firmware.Bootloader = &cnv.Bootloader{BIOS: &cnv.BIOS{}}
 	}
 	object.Template.Spec.Domain.Firmware = firmware
 }
 
-func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims []*core.PersistentVolumeClaim, object *cnv.VirtualMachineSpec) {
+func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims []*core.PersistentVolumeClaim, object *cnv.VirtualMachineSpec) error {
 	var kVolumes []cnv.Volume
 	var kDisks []cnv.Disk
 
@@ -701,9 +717,9 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 		pvc := persistentVolumeClaims[i]
 		// the PVC BackingFile value has already been trimmed.
 		if source, ok := pvc.Annotations[planbase.AnnDiskSource]; ok {
-			pvcMap[source] = pvc
+			pvcMap[trimBackingFileName(source)] = pvc
 		} else {
-			pvcMap[pvc.Annotations[AnnImportBackingFile]] = pvc
+			pvcMap[trimBackingFileName(pvc.Annotations[AnnImportBackingFile])] = pvc
 		}
 	}
 
@@ -716,7 +732,13 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 	}
 
 	for i, disk := range disks {
-		pvc := pvcMap[r.baseVolume(disk.File)]
+		// If the user creates in middle of migration snapshot the disk file name gets the snapshot suffix.
+		// This is updated in the inventory as it's the current disk state, but all PVCs and DVs were created with
+		// the original name. The trim will remove the suffix from the disk name showing the original name.
+		pvc := pvcMap[trimBackingFileName(disk.File)]
+		if pvc == nil {
+			return fmt.Errorf("failed to find persistent volume for disk %s", disk.File)
+		}
 		volumeName := fmt.Sprintf("vol-%v", i)
 		volume := cnv.Volume{
 			Name: volumeName,
@@ -728,13 +750,22 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 				},
 			},
 		}
+		bus := cnv.DiskBusVirtio
+		if r.Plan.Spec.DiskBus != "" {
+			bus = r.Plan.Spec.DiskBus
+		}
+
 		kubevirtDisk := cnv.Disk{
 			Name: volumeName,
 			DiskDevice: cnv.DiskDevice{
 				Disk: &cnv.DiskTarget{
-					Bus: Virtio,
+					Bus: bus,
 				},
 			},
+		}
+		if disk.Shared {
+			kubevirtDisk.Shareable = ptr.To(true)
+			kubevirtDisk.Cache = cnv.CacheNone
 		}
 		// For multiboot VMs, if the selected boot device is the current disk,
 		// set it as the first in the boot order.
@@ -746,11 +777,17 @@ func (r *Builder) mapDisks(vm *model.VM, vmRef ref.Ref, persistentVolumeClaims [
 	}
 	object.Template.Spec.Volumes = kVolumes
 	object.Template.Spec.Domain.Devices.Disks = kDisks
+	return nil
 }
 
 func (r *Builder) mapTpm(vm *model.VM, object *cnv.VirtualMachineSpec) {
 	if vm.TpmEnabled {
 		persistData := true
+		object.Template.Spec.Domain.Devices.TPM = &cnv.TPMDevice{Persistent: &persistData}
+	}
+	if vm.Firmware == BIOS {
+		// Disable the vTPM on non UEFI
+		persistData := false
 		object.Template.Spec.Domain.Devices.TPM = &cnv.TPMDevice{Persistent: &persistData}
 	}
 }
@@ -763,12 +800,15 @@ func (r *Builder) Tasks(vmRef ref.Ref) (list []*plan.Task, err error) {
 		err = liberr.Wrap(err, "vm", vmRef.String())
 		return
 	}
+	if !r.Context.Plan.Spec.MigrateSharedDisks {
+		vm.RemoveSharedDisks()
+	}
 	for _, disk := range vm.Disks {
 		mB := disk.Capacity / 0x100000
 		list = append(
 			list,
 			&plan.Task{
-				Name: r.baseVolume(disk.File),
+				Name: baseVolume(disk.File, r.Plan.Spec.Warm),
 				Progress: libitr.Progress{
 					Total: mB,
 				},
@@ -825,12 +865,12 @@ func (r *Builder) TemplateLabels(vmRef ref.Ref) (labels map[string]string, err e
 
 // Return a stable identifier for a VDDK DataVolume.
 func (r *Builder) ResolveDataVolumeIdentifier(dv *cdi.DataVolume) string {
-	return r.baseVolume(dv.ObjectMeta.Annotations[planbase.AnnDiskSource])
+	return baseVolume(dv.ObjectMeta.Annotations[planbase.AnnDiskSource], r.Plan.Spec.Warm)
 }
 
 // Return a stable identifier for a PersistentDataVolume.
 func (r *Builder) ResolvePersistentVolumeClaimIdentifier(pvc *core.PersistentVolumeClaim) string {
-	return r.baseVolume(pvc.Annotations[AnnImportBackingFile])
+	return baseVolume(pvc.Annotations[AnnImportBackingFile], r.Plan.Spec.Warm)
 }
 
 // Load
@@ -927,31 +967,6 @@ func (r *Builder) host(hostID string) (host *model.Host, err error) {
 	}
 
 	return
-}
-
-// Trims the snapshot suffix from a disk backing file name if there is one.
-//
-//	Example:
-//	Input: 	[datastore13] my-vm/disk-name-000015.vmdk
-//	Output: [datastore13] my-vm/disk-name.vmdk
-func trimBackingFileName(fileName string) string {
-	return backingFilePattern.ReplaceAllString(fileName, ".vmdk")
-}
-
-func (r *Builder) baseVolume(fileName string) string {
-	if r.Plan.Spec.Warm {
-		// for warm migrations, we return the very first volume of the disk
-		// as the base volume and CBT will be used to transfer later changes
-		return trimBackingFileName(fileName)
-	} else {
-		// for cold migrations, we return the latest volume as the base,
-		// e.g., my-vm/disk-name-000015.vmdk, since we should transfer
-		// only its state
-		// note that this setting is insignificant when we use virt-v2v on
-		// el9 since virt-v2v doesn't receive the volume to transfer - we
-		// only need this to be consistent for correlating disks with PVCs
-		return fileName
-	}
 }
 
 // Build LUN PVs.

@@ -10,6 +10,7 @@ import (
 	core "k8s.io/api/core/v1"
 	cnv "kubevirt.io/api/core/v1"
 	cdi "kubevirt.io/containerized-data-importer-api/pkg/apis/core/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 // Annotations
@@ -104,11 +105,13 @@ type Client interface {
 	// Return whether the source VM is powered off.
 	PoweredOff(vmRef ref.Ref) (bool, error)
 	// Create a snapshot of the source VM.
-	CreateSnapshot(vmRef ref.Ref, hostsFunc util.HostsFunc) (string, error)
-	// Remove all warm migration snapshots.
-	RemoveSnapshots(vmRef ref.Ref, precopies []planapi.Precopy, hostsFunc util.HostsFunc) error
+	CreateSnapshot(vmRef ref.Ref, hostsFunc util.HostsFunc) (snapshotId string, creationTaskId string, err error)
+	// Remove a snapshot.
+	RemoveSnapshot(vmRef ref.Ref, snapshot string, hostsFunc util.HostsFunc) (removeTaskId string, err error)
 	// Check if a snapshot is ready to transfer.
-	CheckSnapshotReady(vmRef ref.Ref, snapshot string) (ready bool, err error)
+	CheckSnapshotReady(vmRef ref.Ref, precopy planapi.Precopy, hosts util.HostsFunc) (ready bool, snapshotId string, err error)
+	// Check if a snapshot is removed.
+	CheckSnapshotRemove(vmRef ref.Ref, precopy planapi.Precopy, hosts util.HostsFunc) (ready bool, err error)
 	// Set DataVolume checkpoints.
 	SetCheckpoints(vmRef ref.Ref, precopies []planapi.Precopy, datavolumes []cdi.DataVolume, final bool, hostsFunc util.HostsFunc) (err error)
 	// Close connections to the provider API.
@@ -119,6 +122,8 @@ type Client interface {
 	DetachDisks(vmRef ref.Ref) error
 	// Actions on source env needed before running the populator pods
 	PreTransferActions(vmRef ref.Ref) (ready bool, err error)
+	// Get disk deltas for a VM snapshot.
+	GetSnapshotDeltas(vmRef ref.Ref, snapshot string, hostsFunc util.HostsFunc) (map[string]string, error)
 }
 
 // Validator API.
@@ -138,6 +143,8 @@ type Validator interface {
 	PodNetwork(vmRef ref.Ref) (bool, error)
 	// Validate that we have information about static IPs for every virtual NIC
 	StaticIPs(vmRef ref.Ref) (bool, error)
+	// Validate the shared disk, returns msg and category as the errors depends on the provider implementations
+	SharedDisks(vmRef ref.Ref, client client.Client) (ok bool, msg string, category string, err error)
 	// Validate that the vm has the change tracking enabled
 	ChangeTrackingEnabled(vmRef ref.Ref) (bool, error)
 }

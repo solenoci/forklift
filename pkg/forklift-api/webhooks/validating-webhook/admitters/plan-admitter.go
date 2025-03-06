@@ -4,6 +4,7 @@ import (
 	"context"
 
 	v1 "k8s.io/api/storage/v1"
+	cnv "kubevirt.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"encoding/json"
@@ -109,17 +110,16 @@ func (admitter *PlanAdmitter) validateLUKS() error {
 		return err
 	}
 
-	coldLocal, vErr := admitter.plan.VSphereColdLocal()
-	if vErr != nil {
-		log.Error(vErr, "Could not analyze plan, failing")
-		return vErr
-	}
-	if !coldLocal {
-		err := liberr.New("migration of encrypted disks is not supported for warm migrations or migrations to remote providers")
-		log.Error(err, "Warm migration does not support LUKS")
-		return err
-	}
 	return nil
+}
+
+func (admitter *PlanAdmitter) IsValidDiskBus() bool {
+	switch admitter.plan.Spec.DiskBus {
+	case cnv.DiskBusSCSI, cnv.DiskBusSATA, cnv.DiskBusVirtio:
+		return true
+	default:
+		return false
+	}
 }
 
 func (admitter *PlanAdmitter) Admit(ar *admissionv1.AdmissionReview) *admissionv1.AdmissionResponse {
@@ -172,6 +172,9 @@ func (admitter *PlanAdmitter) Admit(ar *admissionv1.AdmissionReview) *admissionv
 	if err != nil {
 		return util.ToAdmissionResponseError(err)
 	}
-
+	if admitter.plan.Spec.DiskBus != "" && !admitter.IsValidDiskBus() {
+		err = liberr.New(fmt.Sprintf("migration to diskBus '%s' is not supported", admitter.plan.Spec.DiskBus))
+		return util.ToAdmissionResponseError(err)
+	}
 	return util.ToAdmissionResponseAllow()
 }

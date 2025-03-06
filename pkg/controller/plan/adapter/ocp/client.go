@@ -25,7 +25,12 @@ type Client struct {
 }
 
 // CheckSnapshotReady implements base.Client
-func (r *Client) CheckSnapshotReady(vmRef ref.Ref, snapshot string) (bool, error) {
+func (r *Client) CheckSnapshotReady(vmRef ref.Ref, precopy planapi.Precopy, hosts util.HostsFunc) (bool, string, error) {
+	return false, "", nil
+}
+
+// CheckSnapshotRemove implements base.Client
+func (r *Client) CheckSnapshotRemove(vmRef ref.Ref, precopy planapi.Precopy, hosts util.HostsFunc) (bool, error) {
 	return false, nil
 }
 
@@ -35,8 +40,18 @@ func (r *Client) Close() {
 }
 
 // CreateSnapshot implements base.Client
-func (r *Client) CreateSnapshot(vmRef ref.Ref, hostsFunc util.HostsFunc) (string, error) {
-	return "", nil
+func (r *Client) CreateSnapshot(vmRef ref.Ref, hostsFunc util.HostsFunc) (string, string, error) {
+	return "", "", nil
+}
+
+// Remove a VM snapshot. No-op for this provider.
+func (r *Client) RemoveSnapshot(vmRef ref.Ref, snapshot string, hostsFunc util.HostsFunc) (removeTaskId string, err error) {
+	return
+}
+
+// Get disk deltas for a VM snapshot. No-op for this provider.
+func (r *Client) GetSnapshotDeltas(vmRef ref.Ref, snapshot string, hostsFunc util.HostsFunc) (s map[string]string, err error) {
+	return
 }
 
 // Finalize implements base.Client
@@ -121,11 +136,6 @@ func (r *Client) PoweredOff(vmRef ref.Ref) (bool, error) {
 	}
 
 	return true, nil
-}
-
-// RemoveSnapshots implements base.Client
-func (r *Client) RemoveSnapshots(vmRef ref.Ref, precopies []planapi.Precopy, hostsFunc util.HostsFunc) error {
-	return nil
 }
 
 // SetCheckpoints implements base.Client

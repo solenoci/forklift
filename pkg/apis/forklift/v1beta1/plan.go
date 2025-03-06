@@ -24,6 +24,7 @@ import (
 	liberr "github.com/konveyor/forklift-controller/pkg/lib/error"
 	core "k8s.io/api/core/v1"
 	meta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	cnv "kubevirt.io/api/core/v1"
 )
 
 // PlanSpec defines the desired state of Plan.
@@ -48,6 +49,14 @@ type PlanSpec struct {
 	PreserveClusterCPUModel bool `json:"preserveClusterCpuModel,omitempty"`
 	// Preserve static IPs of VMs in vSphere
 	PreserveStaticIPs bool `json:"preserveStaticIPs,omitempty"`
+	// Specify the disk bus which will be applied to all VMs disks in plan.
+	// Possible options 'scsi', 'sata' and 'virtio'.
+	// Defaults to 'virtio'.
+	// +optional
+	DiskBus cnv.DiskBus `json:"diskBus,omitempty"`
+	// Determines if the plan should migrate shared disks.
+	// +kubebuilder:default:=true
+	MigrateSharedDisks bool `json:"migrateSharedDisks,omitempty"`
 }
 
 // Find a planned VM.
@@ -97,7 +106,7 @@ type Plan struct {
 // just use virt-v2v directly to convert the vm while copying data over. In other
 // cases, we use CDI to transfer disks to the destination cluster and then use
 // virt-v2v-in-place to convert these disks after cutover.
-func (p *Plan) VSphereColdLocal() (bool, error) {
+func (p *Plan) ShouldUseV2vForTransfer() (bool, error) {
 	source := p.Referenced.Provider.Source
 	if source == nil {
 		return false, liberr.New("Cannot analyze plan, source provider is missing.")
@@ -109,7 +118,9 @@ func (p *Plan) VSphereColdLocal() (bool, error) {
 
 	switch source.Type() {
 	case VSphere:
-		return !p.Spec.Warm && destination.IsHost(), nil
+		// The virt-v2v transferes all disks attached to the VM. If we want to skip the shared disks so we don't transfer
+		// them multiple times we need to manage the transfer using KubeVirt CDI DataVolumes and v2v-in-place.
+		return !p.Spec.Warm && destination.IsHost() && p.Spec.MigrateSharedDisks, nil
 	case Ova:
 		return true, nil
 	default:
@@ -139,3 +150,5 @@ func (r *Plan) IsSourceProviderOvirt() bool {
 func (r *Plan) IsSourceProviderOCP() bool {
 	return r.Provider.Source.Type() == OpenShift
 }
+
+func (r *Plan) IsSourceProviderVSphere() bool { return r.Provider.Source.Type() == VSphere }

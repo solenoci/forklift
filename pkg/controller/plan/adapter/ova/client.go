@@ -45,19 +45,29 @@ func (r *Client) connect() (err error) {
 	return
 }
 
-// Create a VM snapshot and return its ID.
-func (r *Client) CreateSnapshot(vmRef ref.Ref, hostsFunc util.HostsFunc) (snapshot string, err error) {
+// Create a VM snapshot and return its ID. No-op for this provider.
+func (r *Client) CreateSnapshot(vmRef ref.Ref, hostsFunc util.HostsFunc) (snapshotId string, creationTaskId string, err error) {
 	return
 }
 
-// Remove all warm migration snapshots.
-func (r *Client) RemoveSnapshots(vmRef ref.Ref, precopies []planapi.Precopy, hostsFunc util.HostsFunc) (err error) {
+// Remove a VM snapshot. No-op for this provider.
+func (r *Client) RemoveSnapshot(vmRef ref.Ref, snapshot string, hostsFunc util.HostsFunc) (removeTaskId string, err error) {
+	return
+}
+
+// Get disk deltas for a VM snapshot. No-op for this provider.
+func (r *Client) GetSnapshotDeltas(vmRef ref.Ref, snapshot string, hostsFunc util.HostsFunc) (s map[string]string, err error) {
 	return
 }
 
 // Check if a snapshot is ready to transfer, to avoid importer restarts.
-func (r *Client) CheckSnapshotReady(vmRef ref.Ref, snapshot string) (ready bool, err error) {
+func (r *Client) CheckSnapshotReady(vmRef ref.Ref, precopy planapi.Precopy, hosts util.HostsFunc) (ready bool, snapshotId string, err error) {
 	return
+}
+
+// CheckSnapshotRemove implements base.Client
+func (r *Client) CheckSnapshotRemove(vmRef ref.Ref, precopy planapi.Precopy, hosts util.HostsFunc) (bool, error) {
+	return false, nil
 }
 
 // Set DataVolume checkpoints.

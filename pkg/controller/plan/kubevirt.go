@@ -2,11 +2,13 @@ package plan
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -15,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	k8snet "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	planbase "github.com/konveyor/forklift-controller/pkg/controller/plan/adapter/base"
 	"github.com/konveyor/forklift-controller/pkg/controller/plan/util"
 	"github.com/konveyor/forklift-controller/pkg/controller/provider/web"
@@ -53,8 +56,15 @@ import (
 
 // Annotations
 const (
+	// Legacy transfer network annotation (value=network-attachment-definition name)
+	// FIXME: this should be phased out and replaced with the
+	// k8s.v1.cni.cncf.io/networks annotation.
+	AnnLegacyTransferNetwork = "v1.multus-cni.io/default-network"
 	// Transfer network annotation (value=network-attachment-definition name)
-	AnnDefaultNetwork = "v1.multus-cni.io/default-network"
+	AnnTransferNetwork = "k8s.v1.cni.cncf.io/networks"
+	// Annotation to specify the default route for the transfer network.
+	// To be set on the transfer network NAD by the end user.
+	AnnForkliftNetworkRoute = "forklift.konveyor.io/route"
 	// Contains validations for a Kubevirt VM. Needs to be removed when
 	// creating a VM from a template.
 	AnnKubevirtValidations = "vm.kubevirt.io/validations"
@@ -661,7 +671,7 @@ func (r *KubeVirt) getDVs(vm *plan.VMStatus) (edvs []ExtendedDataVolume, err err
 		context.TODO(),
 		dvsList,
 		&client.ListOptions{
-			LabelSelector: k8slabels.SelectorFromSet(r.vmLabels(vm.Ref)),
+			LabelSelector: k8slabels.SelectorFromSet(r.vmAllButMigrationLabels(vm.Ref)),
 			Namespace:     r.Plan.Spec.TargetNamespace,
 		})
 
@@ -763,6 +773,16 @@ func (r *KubeVirt) createPodToBindPVCs(vm *plan.VMStatus, pvcNames []string) (er
 					// In that case, we could benefit from pulling the image of the conversion pod, so it will be present on the node.
 					Image:   Settings.Migration.VirtV2vImage,
 					Command: []string{"/bin/sh"},
+					Resources: core.ResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceCPU:    resource.MustParse(Settings.Migration.VirtV2vContainerRequestsCpu),
+							core.ResourceMemory: resource.MustParse(Settings.Migration.VirtV2vContainerRequestsMemory),
+						},
+						Limits: core.ResourceList{
+							core.ResourceCPU:    resource.MustParse(Settings.Migration.VirtV2vContainerLimitsCpu),
+							core.ResourceMemory: resource.MustParse(Settings.Migration.VirtV2vContainerLimitsMemory),
+						},
+					},
 					SecurityContext: &core.SecurityContext{
 						AllowPrivilegeEscalation: &allowPrivilageEscalation,
 						RunAsNonRoot:             &nonRoot,
@@ -1227,9 +1247,12 @@ func (r *KubeVirt) dataVolumes(vm *plan.VMStatus, secret *core.Secret, configMap
 		annotations[planbase.AnnRetainAfterCompletion] = "true"
 	}
 	if r.Plan.Spec.TransferNetwork != nil {
-		annotations[AnnDefaultNetwork] = path.Join(
-			r.Plan.Spec.TransferNetwork.Namespace, r.Plan.Spec.TransferNetwork.Name)
+		err = r.setTransferNetwork(annotations)
+		if err != nil {
+			return
+		}
 	}
+
 	if r.Plan.Spec.Warm || !r.Destination.Provider.IsHost() || r.Plan.IsSourceProviderOCP() {
 		// Set annotation for WFFC storage classes. Note that we create data volumes while
 		// running a cold migration to the local cluster only when the source is either OpenShift
@@ -1685,12 +1708,12 @@ func (r *KubeVirt) guestConversionPod(vm *plan.VMStatus, vmVolumes []cnv.Volume,
 	nonRoot := true
 	allowPrivilageEscalation := false
 	// virt-v2v image
-	coldLocal, vErr := r.Context.Plan.VSphereColdLocal()
+	useV2vForTransfer, vErr := r.Context.Plan.ShouldUseV2vForTransfer()
 	if vErr != nil {
 		err = vErr
 		return
 	}
-	if coldLocal {
+	if useV2vForTransfer {
 		// mount the secret for the password and CA certificate
 		volumes = append(volumes, core.Volume{
 			Name: "secret-volume",
@@ -1725,6 +1748,16 @@ func (r *KubeVirt) guestConversionPod(vm *plan.VMStatus, vmVolumes []cnv.Volume,
 					MountPath: "/opt",
 				},
 			},
+			Resources: core.ResourceRequirements{
+				Requests: core.ResourceList{
+					core.ResourceCPU:    resource.MustParse("100m"),
+					core.ResourceMemory: resource.MustParse("150Mi"),
+				},
+				Limits: core.ResourceList{
+					core.ResourceCPU:    resource.MustParse("1000m"),
+					core.ResourceMemory: resource.MustParse("500Mi"),
+				},
+			},
 			SecurityContext: &core.SecurityContext{
 				AllowPrivilegeEscalation: &allowPrivilageEscalation,
 				Capabilities: &core.Capabilities{
@@ -1748,12 +1781,19 @@ func (r *KubeVirt) guestConversionPod(vm *plan.VMStatus, vmVolumes []cnv.Volume,
 				Value: vm.NewName,
 			})
 	}
-
+	environment = append(environment,
+		core.EnvVar{
+			Name:  "LOCAL_MIGRATION",
+			Value: strconv.FormatBool(r.Destination.Provider.IsHost()),
+		},
+	)
 	// pod annotations
 	annotations := map[string]string{}
 	if r.Plan.Spec.TransferNetwork != nil {
-		annotations[AnnDefaultNetwork] = path.Join(
-			r.Plan.Spec.TransferNetwork.Namespace, r.Plan.Spec.TransferNetwork.Name)
+		err = r.setTransferNetwork(annotations)
+		if err != nil {
+			return
+		}
 	}
 	// pod
 	pod = &core.Pod{
@@ -1800,8 +1840,19 @@ func (r *KubeVirt) guestConversionPod(vm *plan.VMStatus, vmVolumes []cnv.Volume,
 			InitContainers: initContainers,
 			Containers: []core.Container{
 				{
-					Name: "virt-v2v",
-					Env:  environment,
+					Name:            "virt-v2v",
+					Env:             environment,
+					ImagePullPolicy: core.PullAlways,
+					Resources: core.ResourceRequirements{
+						Requests: core.ResourceList{
+							core.ResourceCPU:    resource.MustParse(Settings.Migration.VirtV2vContainerRequestsCpu),
+							core.ResourceMemory: resource.MustParse(Settings.Migration.VirtV2vContainerRequestsMemory),
+						},
+						Limits: core.ResourceList{
+							core.ResourceCPU:    resource.MustParse(Settings.Migration.VirtV2vContainerLimitsCpu),
+							core.ResourceMemory: resource.MustParse(Settings.Migration.VirtV2vContainerLimitsMemory),
+						},
+					},
 					EnvFrom: []core.EnvFromSource{
 						{
 							Prefix: "V2V_",
@@ -1849,6 +1900,15 @@ func (r *KubeVirt) podVolumeMounts(vmVolumes []cnv.Volume, configMap *core.Confi
 
 	for i, v := range vmVolumes {
 		pvc := pvcsByName[v.PersistentVolumeClaim.ClaimName]
+		if pvc == nil {
+			r.Log.V(1).Info(
+				"Failed to find the PVC to the Volume for the pod volume mount",
+				"volume",
+				v.Name,
+				"pvc",
+				v.PersistentVolumeClaim.ClaimName)
+			continue
+		}
 		vol := core.Volume{
 			Name: pvc.Name,
 			VolumeSource: core.VolumeSource{
@@ -2030,6 +2090,15 @@ func (r *KubeVirt) libvirtDomain(vmCr *VirtualMachine, pvcs []*core.PersistentVo
 		diskSource := libvirtxml.DomainDiskSource{}
 
 		pvc := pvcsByName[vol.PersistentVolumeClaim.ClaimName]
+		if pvc == nil {
+			r.Log.V(1).Info(
+				"Failed to find the PVC to the Volume for the libvirt domain",
+				"volume",
+				vol.Name,
+				"pvc",
+				vol.PersistentVolumeClaim.ClaimName)
+			continue
+		}
 		if pvc.Spec.VolumeMode != nil && *pvc.Spec.VolumeMode == core.PersistentVolumeBlock {
 			diskSource.Block = &libvirtxml.DomainDiskSourceBlock{
 				Dev: fmt.Sprintf("/dev/block%v", i),
@@ -2342,6 +2411,52 @@ func (r *KubeVirt) vmLabels(vmRef ref.Ref) (labels map[string]string) {
 func (r *KubeVirt) vmAllButMigrationLabels(vmRef ref.Ref) (labels map[string]string) {
 	labels = r.vmLabels(vmRef)
 	delete(labels, kMigration)
+	return
+}
+
+// setTransferNetwork sets the transfer network annotation on the DataVolume so
+// that it can be used by the importer pod. If the `forklift.konveyor.io/route` annotation
+// is present on the referenced NAD, then it will be used with the `k8s.v1.cni.cncf.io/networks` annotation
+// to set the default route. If not, this will fall back to setting the `v1.multus-cni.io/default-network` annotation
+// with the namespaced name of the NAD.
+// FIXME: the codepath using the multus annotation should be phased out.
+func (r *KubeVirt) setTransferNetwork(annotations map[string]string) (err error) {
+	key := client.ObjectKey{
+		Namespace: r.Plan.Spec.TransferNetwork.Namespace,
+		Name:      r.Plan.Spec.TransferNetwork.Name,
+	}
+	netAttachDef := &k8snet.NetworkAttachmentDefinition{}
+	err = r.Get(context.TODO(), key, netAttachDef)
+	if err != nil {
+		err = liberr.Wrap(err)
+		return
+	}
+
+	route, found := netAttachDef.Annotations[AnnForkliftNetworkRoute]
+	if found {
+		nse := k8snet.NetworkSelectionElement{
+			Namespace: key.Namespace,
+			Name:      key.Name,
+		}
+		ip := net.ParseIP(route)
+		if ip != nil {
+			nse.GatewayRequest = []net.IP{ip}
+		} else {
+			err = liberr.New(
+				"Transfer network default route annotation is not a valid IP address.",
+				"route", route)
+			return
+		}
+		transferNetwork, jErr := json.Marshal([]k8snet.NetworkSelectionElement{nse})
+		if jErr != nil {
+			err = liberr.Wrap(jErr)
+			return
+		}
+		annotations[AnnTransferNetwork] = string(transferNetwork)
+	} else {
+		annotations[AnnLegacyTransferNetwork] = path.Join(key.Namespace, key.Name)
+	}
+
 	return
 }
 

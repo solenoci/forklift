@@ -3,6 +3,7 @@ package vsphere
 import (
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 
 	model "github.com/konveyor/forklift-controller/pkg/controller/provider/model/vsphere"
@@ -389,6 +390,10 @@ func (v *NetworkAdapter) Apply(u types.ObjectUpdate) {
 				}
 			case fDVSwitch:
 				v.model.DVSwitch = v.Ref(p.Val)
+			case fSummary:
+				if s, cast := p.Val.(types.OpaqueNetworkSummary); cast {
+					v.model.Key = s.OpaqueNetworkId
+				}
 			}
 		}
 	}
@@ -539,6 +544,12 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 				if a, cast := p.Val.(types.VirtualMachineAffinityInfo); cast {
 					v.model.CpuAffinity = a.AffinitySet
 				}
+			case fBootOptions:
+				if a, cast := p.Val.(types.VirtualMachineBootOptions); cast {
+					if a.EfiSecureBootEnabled != nil {
+						v.model.SecureBoot = *a.EfiSecureBootEnabled
+					}
+				}
 			case fCpuHotAddEnabled:
 				if b, cast := p.Val.(bool); cast {
 					v.model.CpuHotAddEnabled = b
@@ -610,6 +621,14 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 							if s, cast := opt.Value.(string); cast {
 								v.model.NumaNodeAffinity = strings.Split(s, ",")
 							}
+						case "ctkEnabled":
+							if s, cast := opt.Value.(string); cast {
+								boolVal, err := strconv.ParseBool(s)
+								if err != nil {
+									return
+								}
+								v.model.ChangeTrackingEnabled = boolVal
+							}
 						}
 					}
 				}
@@ -645,10 +664,14 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 					for _, ipa := range ipas.GuestStackInfo {
 						routes := ipa.IpRouteConfig.IpRoute
 						for _, route := range routes {
+							var dnsList []string
+							if ipa.DnsConfig != nil {
+								dnsList = ipa.DnsConfig.IpAddress
+							}
 							if len(route.Gateway.IpAddress) > 0 {
 								guestIpStackList = append(guestIpStackList, model.GuestIpStack{
 									Gateway: route.Gateway.IpAddress,
-									DNS:     ipa.DnsConfig.IpAddress,
+									DNS:     dnsList,
 								})
 							}
 						}
@@ -695,6 +718,8 @@ func (v *VmAdapter) Apply(u types.ObjectUpdate) {
 								}
 							case *types.VirtualEthernetCardDistributedVirtualPortBackingInfo:
 								network = backing.Port.PortgroupKey
+							case *types.VirtualEthernetCardOpaqueNetworkBackingInfo:
+								network = backing.OpaqueNetworkId
 							}
 
 							devList = append(
