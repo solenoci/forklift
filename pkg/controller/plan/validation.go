@@ -1521,7 +1521,6 @@ func (r *Reconciler) getVmPVCs(plan *api.Plan, vm *vsphere.VM) (pvcs []*core.Per
 			Namespace:     plan.Spec.TargetNamespace,
 		},
 	)
-
 	if err != nil {
 		err = liberr.Wrap(err)
 		return

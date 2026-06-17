@@ -60,7 +60,11 @@ const (
 const (
 	V2vOutputDir            = "/var/tmp/v2v"
 	InspectionOutputFile    = V2vOutputDir + "/inspection.xml"
-	VddkLib                 = "/opt/vmware-vix-disklib-distrib"
+	// VddkMount is the EmptyDir mount-path where the VDDK sidecar populates
+	// the image contents. It is the root from which any file search inside
+	// the VDDK image must begin.
+	VddkMount               = "/opt"
+	VddkLib                 = VddkMount + "/vmware-vix-disklib-distrib"
 	Luksdir                 = "/etc/luks"
 	VddkConfFile            = "/mnt/vddk-conf/vddk-config-file"
 	DynamicScriptsMountPath = "/mnt/dynamic_scripts"

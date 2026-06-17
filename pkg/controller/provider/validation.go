@@ -526,7 +526,6 @@ func (r *Reconciler) checkOVAServiceReady(provider *api.Provider) bool {
 			LabelSelector: labels.SelectorFromSet(labeler.ProviderLabels(provider)),
 			Namespace:     Settings.Namespace,
 		})
-
 	if err != nil {
 		// If we can't list deployments, log but don't fail - allow connection test to proceed
 		log.Error(err, "Failed to list deployments for OVA provider")

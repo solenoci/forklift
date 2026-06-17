@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"embed"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -24,6 +25,11 @@ const (
 	UploadCmd               = "--upload"
 	RunCmd                  = "--run"
 	FirstbootCmd            = "--firstboot"
+
+	// DevconExeGuestDir is the directory inside the Windows guest where devcon.exe is installed.
+	DevconExeGuestDir = "/Windows/Build/Tools"
+	// DevconExeGuestPath is the full guest path for devcon.exe (maps to C:\Windows\Build\Tools\devcon.exe).
+	DevconExeGuestPath = "/Windows/Build/Tools/devcon.exe"
 )
 
 const vsphereVmwareCleanupScript = "9100_cleanup_vmware.bat"
@@ -97,6 +103,27 @@ func NewCustomize(cfg *config.AppConfig, disks []string, operatingSystem utils.I
 	}
 }
 
+// findDevconExe searches recursively under searchDir for a file named
+// devcon.exe (case-insensitive) and returns its absolute path.
+// Returns an empty string when the file cannot be found or searchDir is empty.
+func findDevconExe(searchDir string) string {
+	if searchDir == "" {
+		return ""
+	}
+	var found string
+	_ = filepath.WalkDir(searchDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.IsDir() && strings.EqualFold(d.Name(), "devcon.exe") {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
+}
+
 func (c *Customize) Run() (err error) {
 	fmt.Printf("Customizing disks '%s'\n", c.disks)
 	// Customization for vSphere source.
@@ -153,6 +180,10 @@ func (c *Customize) customizeWindows() (err error) {
 		c.addVsphereVmwareDriverRemoval(cmdBuilder)
 	}
 
+	if c.appConfig.IsVsphereMigration() {
+		c.addDevconExe(cmdBuilder)
+	}
+
 	if err = c.addWinFirstbootScripts(cmdBuilder); err != nil {
 		return err
 	}
@@ -166,6 +197,22 @@ func (c *Customize) customizeWindows() (err error) {
 	return nil
 }
 
+// addDevconExe searches for devcon.exe starting at the root of the VDDK image
+// volume (config.VddkMount) and, when found, schedules it for upload into the
+// Windows guest at C:\Windows\Build\Tools\devcon.exe via virt-customize.
+// When devcon.exe is absent a warning is logged but the migration continues.
+func (c *Customize) addDevconExe(cmdBuilder utils.CommandBuilder) {
+	devconPath := findDevconExe(config.VddkMount)
+	if devconPath == "" {
+		fmt.Printf("WARNING: devcon.exe not found in VDDK image under %s; "+
+			"device console tool will not be uploaded to the Windows guest\n", config.VddkMount)
+		return
+	}
+	fmt.Printf("Found devcon.exe at %s, uploading to guest at %s\n", devconPath, DevconExeGuestPath)
+	cmdBuilder.AddArg("--mkdir", DevconExeGuestDir)
+	cmdBuilder.AddArg(UploadCmd, c.formatUpload(devconPath, DevconExeGuestPath))
+}
+
 // addDisksToCustomize appends disk arguments to extraArgs
 func (c *Customize) addDisksToCustomize(cmdBuilder utils.CommandBuilder) {
 	for _, disk := range c.disks {
@@ -176,7 +223,6 @@ func (c *Customize) addDisksToCustomize(cmdBuilder utils.CommandBuilder) {
 // In case of multiple IP's per NIC on windows there is an existing setup script that assign only primary IP's
 // With this function and its corresponding template we will inject all the complementry IP's to the NICs
 func (c *Customize) injectComplementryStaticIPTemplate(templatePath, outputPath string) error {
-
 	tmplContent, err := os.ReadFile(templatePath)
 	if err != nil {
 		return fmt.Errorf("failed to read template: %w", err)
@@ -244,7 +290,7 @@ func (c *Customize) injectComplementryStaticIPTemplate(templatePath, outputPath 
 		return fmt.Errorf("failed to render template: %w", err)
 	}
 
-	if err := os.WriteFile(outputPath, buf.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(outputPath, buf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("failed to write output script: %w", err)
 	}
 
@@ -273,7 +319,7 @@ func (c *Customize) injectStaticIPTemplate(templatePath, outputPath string) erro
 		return fmt.Errorf("failed to render template: %w", err)
 	}
 
-	if err := os.WriteFile(outputPath, buf.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(outputPath, buf.Bytes(), 0o644); err != nil {
 		return fmt.Errorf("failed to write output script: %w", err)
 	}
 
@@ -440,7 +486,7 @@ func (c *Customize) handleStaticIPConfiguration(cmdBuilder utils.CommandBuilder)
 		macToIPFilePath := filepath.Join(c.appConfig.Workdir, "macToIP")
 		macToIPFileContent := strings.ReplaceAll(c.appConfig.StaticIPs, "_", "\n") + "\n"
 
-		if err := c.fileSystem.WriteFile(macToIPFilePath, []byte(macToIPFileContent), 0755); err != nil {
+		if err := c.fileSystem.WriteFile(macToIPFilePath, []byte(macToIPFileContent), 0o755); err != nil {
 			return fmt.Errorf("failed to write MAC to IP mapping file: %w", err)
 		}
 		cmdBuilder.AddArg(UploadCmd, fmt.Sprintf("%s:/tmp/macToIP", macToIPFilePath))
